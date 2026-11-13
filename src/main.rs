@@ -71,7 +71,7 @@ fn main() -> eframe::Result {
         viewport: egui::ViewportBuilder::default()
             .with_inner_size([WIN_W, WIN_H])
             .with_decorations(false)
-            .with_transparent(true)
+            .with_transparent(false)
             .with_resizable(false)
             .with_icon(Arc::new(load_icon())),
         // eframe always loads persisted geometry (persist_window only gates saving), so force
@@ -1231,7 +1231,8 @@ fn line(ui: &mut egui::Ui) {
 
 impl eframe::App for AzeApp {
     fn clear_color(&self, _visuals: &egui::Visuals) -> [f32; 4] {
-        [0.0, 0.0, 0.0, 0.0]
+        // opaque: a transparent window renders as see-through stripes on some GPU drivers
+        [20.0 / 255.0, 22.0 / 255.0, 31.0 / 255.0, 1.0]
     }
 
     fn save(&mut self, storage: &mut dyn eframe::Storage) {
@@ -1252,7 +1253,7 @@ impl eframe::App for AzeApp {
         let win = ctx.content_rect();
         ui.painter().rect(
             win.shrink(0.5),
-            CornerRadius::same(16),
+            CornerRadius::same(0),
             BG,
             Stroke::new(1.0, WIN_BORDER),
             StrokeKind::Inside,
