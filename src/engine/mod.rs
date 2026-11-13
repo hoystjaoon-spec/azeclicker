@@ -1,0 +1,658 @@
+//! background click threads; the ui pushes a config snapshot each frame.
+
+pub mod timing;
+
+use crate::os;
+use eframe::egui;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::mpsc::{Receiver, Sender, channel};
+use std::sync::{Arc, Mutex};
+use std::thread::{self, JoinHandle};
+use std::time::{Duration, Instant};
+use timing::{HumanizedDelay, Rng, SmoothJitter, fixed_delays};
+
+/// lock-free flags shared with the threads. relaxed ordering: advisory gates, not syncing memory.
+pub struct EngineSignals {
+    pub suspend_left: AtomicBool,
+    pub suspend_right: AtomicBool,
+    pub panic: AtomicBool,
+    pub mc_focused: AtomicBool,
+    pub mc_running: AtomicBool,
+    pub any_focused: AtomicBool,
+    pub running: AtomicBool,
+    /// taskbar-hide state. whoever flips it also does the os apply; this is just the shared truth.
+    pub taskbar_hidden: AtomicBool,
+    /// bumped on every left attack so blockhit can react to the clicker's own hits
+    pub left_click_seq: AtomicU64,
+    /// set while a rebind is armed: pauses the engine so the bound key doesn't also toggle or click
+    pub capturing: AtomicBool,
+}
+
+/// per-clicker config the engine reads, built from the ui's Clicker each frame
+#[derive(Clone, PartialEq)]
+pub struct ClickerSnap {
+    pub enabled: bool,
+    pub min_cps: f32,
+    pub max_cps: f32,
+    pub cps: f32,
+    pub avoid_gui: bool,
+    pub humanize: bool,
+    pub jitter: bool,
+    pub jitter_intensity: i32,
+    pub only_ingame: bool,
+    /// afk / no-hold: click continuously while enabled instead of only while the button is held
+    pub afk: bool,
+    /// double-click: fire a quick second click a few ms after each one (each press reads as two)
+    pub double_click: bool,
+    /// button/key that has to be held to click. 0 = this clicker's own mouse button.
+    pub trigger_vk: i32,
+    pub suspend_vk: i32,
+    pub hotkey_vk: i32,
+    pub is_left: bool,
+}
+
+#[derive(Clone, Copy, PartialEq)]
+pub struct AudioConfig {
+    pub enabled: bool,
+    pub volume: f32,
+    pub pitch_var: bool,
+    pub separate: bool,
+}
+
+/// blockhit: after a left attack, tap right click so the sword blocks for a moment. delays are ms.
+#[derive(Clone, PartialEq)]
+pub struct BlockHitSnap {
+    pub enabled: bool,
+    pub min_delay: f32,
+    pub max_delay: f32,
+    pub min_hold: f32,
+    pub max_hold: f32,
+    pub chance: f32,
+    pub only_ingame: bool,
+    pub hotkey_vk: i32,
+}
+
+#[derive(Clone, PartialEq)]
+pub struct EngineConfig {
+    pub left: ClickerSnap,
+    pub right: ClickerSnap,
+    pub panic_vk: i32,
+    pub taskbar_vk: i32,
+    pub blockhit: BlockHitSnap,
+    pub audio: AudioConfig,
+}
+
+pub enum ToggleReq {
+    Left,
+    Right,
+    BlockHit,
+}
+
+pub struct EngineHandle {
+    pub signals: Arc<EngineSignals>,
+    pub config: Arc<Mutex<EngineConfig>>,
+    pub toggle_rx: Receiver<ToggleReq>,
+    joins: Vec<JoinHandle<()>>,
+    hook_tid: u32,
+}
+
+impl EngineHandle {
+    pub fn start(
+        ctx: egui::Context,
+        initial: EngineConfig,
+        audio: Option<crate::audio::AudioHandle>,
+    ) -> Self {
+        os::begin_timer_period();
+        let hook_tid = os::start_input_hook();
+
+        let signals = Arc::new(EngineSignals {
+            suspend_left: AtomicBool::new(false),
+            suspend_right: AtomicBool::new(false),
+            panic: AtomicBool::new(false),
+            mc_focused: AtomicBool::new(false),
+            mc_running: AtomicBool::new(false),
+            any_focused: AtomicBool::new(false),
+            running: AtomicBool::new(true),
+            taskbar_hidden: AtomicBool::new(false),
+            left_click_seq: AtomicU64::new(0),
+            capturing: AtomicBool::new(false),
+        });
+        let config = Arc::new(Mutex::new(initial));
+        let (tx, rx) = channel::<ToggleReq>();
+
+        let mut joins = Vec::new();
+        for is_left in [true, false] {
+            let s = signals.clone();
+            let c = config.clone();
+            let a = audio.clone();
+            joins.push(thread::spawn(move || clicker_loop(is_left, s, c, a)));
+        }
+        // jitter runs on its own ~100hz loop (not per-click) so the motion is smooth like v1
+        for is_left in [true, false] {
+            let s = signals.clone();
+            let c = config.clone();
+            joins.push(thread::spawn(move || jitter_loop(is_left, s, c)));
+        }
+        {
+            let s = signals.clone();
+            let c = config.clone();
+            joins.push(thread::spawn(move || key_poll_loop(s, c, tx, ctx)));
+        }
+        {
+            let s = signals.clone();
+            let c = config.clone();
+            joins.push(thread::spawn(move || blockhit_loop(s, c)));
+        }
+
+        EngineHandle {
+            signals,
+            config,
+            toggle_rx: rx,
+            joins,
+            hook_tid,
+        }
+    }
+
+    pub fn shutdown(&mut self) {
+        self.signals.running.store(false, Ordering::Relaxed);
+        os::stop_input_hook(self.hook_tid);
+        for j in self.joins.drain(..) {
+            let _ = j.join();
+        }
+    }
+}
+
+/// map a ui key-name to a windows vk code (0 = none)
+pub fn vk_from_name(name: &str) -> i32 {
+    let n = name.trim();
+    match n.to_ascii_lowercase().as_str() {
+        "" | "none" => 0,
+        "left click" => 0x01,
+        "right click" => 0x02,
+        "middle click" => 0x04,
+        "mouse 4" => 0x05,
+        "mouse 5" => 0x06,
+        "space" => 0x20,
+        "shift" => 0x10,
+        "ctrl" | "control" => 0x11,
+        "alt" => 0x12,
+        "tab" => 0x09,
+        "caps lock" | "capslock" | "caps" => 0x14,
+        "insert" => 0x2D,
+        _ => {
+            if n.chars().count() == 1 {
+                let ch = n.chars().next().unwrap().to_ascii_uppercase();
+                if ch.is_ascii_alphanumeric() {
+                    return ch as i32;
+                }
+                0
+            } else if let Some(num) = n.strip_prefix(['F', 'f']) {
+                match num.parse::<i32>() {
+                    Ok(k) if (1..=24).contains(&k) => 0x70 + (k - 1),
+                    _ => 0,
+                }
+            } else {
+                0
+            }
+        }
+    }
+}
+
+/// keeps the long-run rate accurate by compensating each cycle for dispatch jitter.
+struct ClickScheduler {
+    start: Instant,
+    next_expected: f64,
+}
+
+impl ClickScheduler {
+    fn new() -> Self {
+        Self {
+            start: Instant::now(),
+            next_expected: 0.0,
+        }
+    }
+    fn reset(&mut self) {
+        self.start = Instant::now();
+        self.next_expected = 0.0;
+    }
+    fn next(&mut self, up: f64, down: f64) -> (f64, f64) {
+        let total = up + down;
+        self.next_expected += total;
+        let elapsed = self.start.elapsed().as_secs_f64() * 1000.0;
+        let mut needed = self.next_expected - elapsed;
+        if needed < 10.0 {
+            needed = 10.0;
+            self.next_expected = elapsed + 10.0;
+        }
+        let ratio = if total > 0.0 { up / total } else { 0.9 };
+        let comp_up = (needed * ratio).round().max(0.0);
+        let comp_down = (needed - comp_up).round().max(0.0);
+        (comp_up, comp_down)
+    }
+}
+
+/// is this clicker's trigger held? remapping it (say to a side button) leaves the real mouse
+/// button free, so you can still break blocks without turning the clicker off.
+fn trigger_held(snap: &ClickerSnap) -> bool {
+    if snap.trigger_vk == 0 {
+        os::physical_button_held(snap.is_left)
+    } else {
+        os::key_held(snap.trigger_vk)
+    }
+}
+
+/// accurate wait that bails early if the engine stops or (unless in afk mode) the trigger is released
+fn precise_delay(ms: f64, sig: &EngineSignals, snap: &ClickerSnap, require_hold: bool) {
+    if ms <= 0.0 {
+        return;
+    }
+    let start = Instant::now();
+    let target = Duration::from_secs_f64(ms / 1000.0);
+    loop {
+        if !sig.running.load(Ordering::Relaxed) || (require_hold && !trigger_held(snap)) {
+            break;
+        }
+        let elapsed = start.elapsed();
+        if elapsed >= target {
+            break;
+        }
+        // only sleep while well clear of the deadline; sleep(1) can overshoot by 1-2ms, which at
+        // 13 cps is enough to visibly drag the average down. spin the final stretch instead.
+        if target - elapsed > Duration::from_millis(4) {
+            thread::sleep(Duration::from_millis(1));
+        } else {
+            std::hint::spin_loop();
+        }
+    }
+}
+
+fn clicker_loop(
+    is_left: bool,
+    sig: Arc<EngineSignals>,
+    cfg: Arc<Mutex<EngineConfig>>,
+    audio: Option<crate::audio::AudioHandle>,
+) {
+    os::boost_thread_priority();
+    let mut rng = Rng::seeded(if is_left { 0xA17 } else { 0xB29 });
+    let mut hd = HumanizedDelay::new();
+    let mut sched = ClickScheduler::new();
+    let mut was_clicking = false;
+    let mut phys_was = true; // need a release before the first standalone edge counts
+    let mut dbl_down = false; // an injected double-click press is currently held
+
+    while sig.running.load(Ordering::Relaxed) {
+        let (snap, audio_cfg) = {
+            let c = cfg.lock().unwrap();
+            (
+                if is_left { c.left.clone() } else { c.right.clone() },
+                c.audio,
+            )
+        };
+
+        let suspend = if is_left {
+            sig.suspend_left.load(Ordering::Relaxed)
+        } else {
+            sig.suspend_right.load(Ordering::Relaxed)
+        };
+        let focus_ok = if snap.only_ingame {
+            sig.mc_focused.load(Ordering::Relaxed)
+        } else {
+            sig.any_focused.load(Ordering::Relaxed)
+        };
+        // avoid-gui's cursor check only makes sense in-game (cursor hidden in play, shown in
+        // menus). in "any window" mode the cursor is always visible so don't let it block.
+        let gui_block = snap.avoid_gui && snap.only_ingame && os::cursor_visible();
+        // afk mode drops the hold-to-click requirement: once enabled (and gated by focus/suspend/
+        // avoid-gui), it clicks on its own. otherwise the physical button must be held.
+        let hold = snap.afk || trigger_held(&snap);
+        let should = snap.enabled
+            && !sig.panic.load(Ordering::Relaxed)
+            && !sig.capturing.load(Ordering::Relaxed)
+            && !os::foreground_is_self() // never click into our own window
+            && focus_ok
+            && !gui_block
+            && !suspend
+            && hold;
+
+        if should {
+            if !was_clicking {
+                sched.reset();
+                was_clicking = true;
+            }
+            let (up_ms, down_ms) = if snap.humanize {
+                hd.get_delays(snap.min_cps, snap.max_cps, &mut rng)
+            } else {
+                fixed_delays(snap.cps)
+            };
+            let (comp_up, comp_down) = sched.next(up_ms, down_ms);
+
+            os::click_up(is_left);
+            if audio_cfg.separate {
+                play_click(&audio, audio_cfg);
+            }
+            precise_delay(comp_up, &sig, &snap, !snap.afk);
+            if !snap.afk && !trigger_held(&snap) {
+                continue; // released mid-cycle; next loop's else emits the trailing up
+            }
+            os::click_down(is_left);
+            if is_left {
+                sig.left_click_seq.fetch_add(1, Ordering::Relaxed);
+            }
+            play_click(&audio, audio_cfg);
+            let mut main_hold = comp_down;
+            if snap.double_click {
+                // a rapid second click a few ms after the first, nested inside the hold so the
+                // cycle rate is unchanged: each press just registers as two clicks.
+                // the release has to last long enough for the game to actually see a separate
+                // click; a 2-3ms blip gets swallowed and just reads as one held press.
+                let dh = rng.range(5, 9) as f64;
+                let dg = rng.range(12, 20) as f64;
+                precise_delay(dh, &sig, &snap, !snap.afk);
+                os::click_up(is_left);
+                precise_delay(dg, &sig, &snap, !snap.afk);
+                if snap.afk || trigger_held(&snap) {
+                    os::click_down(is_left);
+                    play_click(&audio, audio_cfg);
+                }
+                main_hold = (comp_down - dh - dg).max(2.0);
+            }
+            precise_delay(main_hold, &sig, &snap, !snap.afk);
+        } else {
+            if was_clicking {
+                os::click_up(is_left);
+                was_clicking = false;
+            }
+            // double-click with the autoclicker idle: split the user's own press into two so a
+            // manual click still reads as two. same gates as clicking, so panic, suspend,
+            // only-in-game and avoid-gui all still stop it.
+            let dbl = snap.double_click
+                && !sig.panic.load(Ordering::Relaxed)
+                && !sig.capturing.load(Ordering::Relaxed)
+                && !os::foreground_is_self()
+                && focus_ok
+                && !gui_block
+                && !suspend;
+            let phys = os::physical_button_held(is_left);
+            if dbl_down && !phys {
+                os::click_up(is_left); // never leave an injected press stuck down
+                dbl_down = false;
+            }
+            if dbl && phys && !phys_was {
+                // this path doubles a real click, so the wait tracks the physical button rather
+                // than a remapped trigger
+                let mut phys_snap = snap.clone();
+                phys_snap.trigger_vk = 0;
+                // let the real press land, then release long enough for the game to register a
+                // distinct second click before re-pressing
+                precise_delay(rng.range(5, 9) as f64, &sig, &phys_snap, true);
+                os::click_up(is_left);
+                precise_delay(rng.range(12, 20) as f64, &sig, &phys_snap, true);
+                // only re-press if they're still holding, else we'd strand the button down
+                if os::physical_button_held(is_left) {
+                    os::click_down(is_left);
+                    play_click(&audio, audio_cfg);
+                    dbl_down = true;
+                }
+            }
+            phys_was = phys;
+            thread::sleep(Duration::from_millis(if dbl { 2 } else { 8 }));
+        }
+    }
+
+    if was_clicking || dbl_down {
+        os::click_up(is_left); // don't leave a button stuck down on shutdown
+    }
+}
+
+// aim-shake while the button is held in-game. own ~100hz loop (not the click rate) so the sine
+// path stays smooth. gated the same as clicking.
+fn jitter_loop(is_left: bool, sig: Arc<EngineSignals>, cfg: Arc<Mutex<EngineConfig>>) {
+    let mut rng = Rng::seeded(if is_left { 0xC17 } else { 0xD29 });
+    let mut jit = SmoothJitter::new();
+    while sig.running.load(Ordering::Relaxed) {
+        let snap = {
+            let c = cfg.lock().unwrap();
+            if is_left { c.left.clone() } else { c.right.clone() }
+        };
+        let suspend = if is_left {
+            sig.suspend_left.load(Ordering::Relaxed)
+        } else {
+            sig.suspend_right.load(Ordering::Relaxed)
+        };
+        let focus_ok = if snap.only_ingame {
+            sig.mc_focused.load(Ordering::Relaxed)
+        } else {
+            sig.any_focused.load(Ordering::Relaxed)
+        };
+        let gui_block = snap.avoid_gui && snap.only_ingame && os::cursor_visible();
+        let active = snap.enabled
+            && snap.jitter
+            && !sig.panic.load(Ordering::Relaxed)
+            && !sig.capturing.load(Ordering::Relaxed)
+            && !os::foreground_is_self()
+            && focus_ok
+            && !gui_block
+            && !suspend
+            && (snap.afk || trigger_held(&snap));
+        if active {
+            if let Some((dx, dy)) = jit.next(snap.jitter_intensity, &mut rng) {
+                os::jitter_move(dx, dy);
+            }
+            thread::sleep(Duration::from_millis(10));
+        } else {
+            jit.reset();
+            thread::sleep(Duration::from_millis(16));
+        }
+    }
+}
+
+// blockhit: right after a left attack, tap right click so the sword blocks for a moment, then
+// release before the next hit. arsenic does this internally off the target's hurtTime; we can't read
+// game state from outside, so we time it from our own attacks instead. delays and the skip chance
+// are randomised so it isn't a fixed pattern after every single hit.
+fn blockhit_loop(sig: Arc<EngineSignals>, cfg: Arc<Mutex<EngineConfig>>) {
+    let mut rng = Rng::seeded(0xB10C);
+    let mut last_seq = 0u64;
+    let mut phys_was = true;
+    let mut blocking = false;
+    let mut release_at = Instant::now();
+    let mut press_at: Option<Instant> = None;
+
+    while sig.running.load(Ordering::Relaxed) {
+        let bh = { cfg.lock().unwrap().blockhit.clone() };
+        let focus_ok = if bh.only_ingame {
+            sig.mc_focused.load(Ordering::Relaxed)
+        } else {
+            sig.any_focused.load(Ordering::Relaxed)
+        };
+        let ok = bh.enabled
+            && !sig.panic.load(Ordering::Relaxed)
+            && !sig.capturing.load(Ordering::Relaxed)
+            && !os::foreground_is_self()
+            && focus_ok;
+
+        let now = Instant::now();
+        if blocking && (!ok || now >= release_at) {
+            os::click_up(false);
+            blocking = false;
+        }
+        if !ok {
+            // stay in sync while idle so re-enabling doesn't fire on a stale edge
+            press_at = None;
+            phys_was = os::physical_button_held(true);
+            last_seq = sig.left_click_seq.load(Ordering::Relaxed);
+            thread::sleep(Duration::from_millis(8));
+            continue;
+        }
+
+        // an attack is either one the clicker fired or, with it idle, a manual press
+        let seq = sig.left_click_seq.load(Ordering::Relaxed);
+        let phys = os::physical_button_held(true);
+        let attacked = seq != last_seq || (phys && !phys_was);
+        last_seq = seq;
+        phys_was = phys;
+
+        if attacked {
+            // always come out of the block for the hit itself, so a hold longer than the click
+            // period can't sit on top of the next attack. hold then acts as an upper bound.
+            if blocking {
+                os::click_up(false);
+                blocking = false;
+            }
+            if press_at.is_none()
+                && !os::physical_button_held(false) // don't fight a block they're already holding
+                && rng.unit() * 100.0 < bh.chance as f64
+            {
+                press_at =
+                    Some(now + Duration::from_secs_f64(pick(bh.min_delay, bh.max_delay, &mut rng)));
+            }
+        }
+        if let Some(t) = press_at {
+            if now >= t {
+                os::click_down(false);
+                blocking = true;
+                release_at = now + Duration::from_secs_f64(pick(bh.min_hold, bh.max_hold, &mut rng));
+                press_at = None;
+            }
+        }
+        thread::sleep(Duration::from_millis(2));
+    }
+    if blocking {
+        os::click_up(false); // never leave the block stuck down
+    }
+}
+
+/// uniform pick between two ms bounds (either order), returned as seconds
+fn pick(a: f32, b: f32, rng: &mut Rng) -> f64 {
+    let (lo, hi) = (a.min(b) as f64, a.max(b) as f64);
+    (lo + rng.unit() * (hi - lo)) / 1000.0
+}
+
+fn play_click(audio: &Option<crate::audio::AudioHandle>, cfg: AudioConfig) {
+    if let (Some(a), true) = (audio, cfg.enabled) {
+        let speed = if cfg.pitch_var { pitch_jitter() } else { 1.0 };
+        a.play(crate::audio::PlayParams {
+            volume: cfg.volume,
+            speed,
+        });
+    }
+}
+
+fn pitch_jitter() -> f32 {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    let n = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.subsec_nanos())
+        .unwrap_or(0);
+    1.0 + ((n % 1000) as f32 / 1000.0 - 0.5) * 0.12
+}
+
+fn key_poll_loop(
+    sig: Arc<EngineSignals>,
+    cfg: Arc<Mutex<EngineConfig>>,
+    tx: Sender<ToggleReq>,
+    ctx: egui::Context,
+) {
+    let mut left_was = true; // need a release before the first edge counts
+    let mut right_was = true;
+    let mut panic_was = true;
+    let mut taskbar_was = true;
+    let mut blockhit_was = true;
+    let mut last_focus = Instant::now()
+        .checked_sub(Duration::from_secs(1))
+        .unwrap_or_else(Instant::now);
+
+    while sig.running.load(Ordering::Relaxed) {
+        // while a rebind is armed, don't toggle/suspend on the bound key. holding *_was true means
+        // the still-held key needs a release before it fires.
+        if sig.capturing.load(Ordering::Relaxed) {
+            left_was = true;
+            right_was = true;
+            panic_was = true;
+            taskbar_was = true;
+            blockhit_was = true;
+            sig.suspend_left.store(false, Ordering::Relaxed);
+            sig.suspend_right.store(false, Ordering::Relaxed);
+            thread::sleep(Duration::from_millis(10));
+            continue;
+        }
+
+        let snap = { cfg.lock().unwrap().clone() };
+
+        sig.suspend_left.store(
+            snap.left.suspend_vk != 0 && os::key_held(snap.left.suspend_vk),
+            Ordering::Relaxed,
+        );
+        sig.suspend_right.store(
+            snap.right.suspend_vk != 0 && os::key_held(snap.right.suspend_vk),
+            Ordering::Relaxed,
+        );
+
+        // flip the live config here so the clicker stops/starts instantly, without waiting on a ui
+        // frame: the app is usually occluded behind the game where request_repaint may not paint, so
+        // a toggle-off sometimes didn't take. the ToggleReq just syncs the ui widget.
+        edge(snap.left.hotkey_vk, &mut left_was, || {
+            cfg.lock().unwrap().left.enabled ^= true;
+            let _ = tx.send(ToggleReq::Left);
+            ctx.request_repaint();
+        });
+        edge(snap.right.hotkey_vk, &mut right_was, || {
+            cfg.lock().unwrap().right.enabled ^= true;
+            let _ = tx.send(ToggleReq::Right);
+            ctx.request_repaint();
+        });
+        edge(snap.blockhit.hotkey_vk, &mut blockhit_was, || {
+            cfg.lock().unwrap().blockhit.enabled ^= true;
+            let _ = tx.send(ToggleReq::BlockHit);
+            ctx.request_repaint();
+        });
+        if snap.panic_vk != 0 {
+            let p = os::key_held(snap.panic_vk);
+            if p && !panic_was {
+                sig.panic.store(true, Ordering::Relaxed);
+                ctx.send_viewport_cmd(egui::ViewportCommand::Close); // panic = quit
+                ctx.request_repaint();
+            }
+            panic_was = p;
+        }
+
+        // edge-toggle the shared flag and apply straight to the window here (must work while the
+        // game is focused and our ui isn't repainting, like the clicker toggle).
+        if snap.taskbar_vk != 0 {
+            let p = os::key_held(snap.taskbar_vk);
+            if p && !taskbar_was {
+                let now = !sig.taskbar_hidden.load(Ordering::Relaxed);
+                sig.taskbar_hidden.store(now, Ordering::Relaxed);
+                os::set_taskbar_hidden(now);
+                ctx.request_repaint();
+            }
+            taskbar_was = p;
+        } else {
+            taskbar_was = true;
+        }
+
+        if last_focus.elapsed() >= Duration::from_millis(150) {
+            sig.mc_focused
+                .store(os::is_minecraft_active(), Ordering::Relaxed);
+            sig.mc_running
+                .store(os::is_minecraft_running(), Ordering::Relaxed);
+            sig.any_focused
+                .store(os::any_window_focused(), Ordering::Relaxed);
+            last_focus = Instant::now();
+        }
+
+        thread::sleep(Duration::from_millis(10));
+    }
+}
+
+fn edge(vk: i32, was: &mut bool, on_press: impl FnOnce()) {
+    if vk == 0 {
+        *was = true;
+        return;
+    }
+    let p = os::key_held(vk);
+    if p && !*was {
+        on_press();
+    }
+    *was = p;
+}
